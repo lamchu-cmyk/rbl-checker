@@ -145,24 +145,46 @@ function reverseIp(ip) {
 async function checkOneZone(ip, zone, { timeoutMs = 3000 } = {}) {
   const reversed = reverseIp(ip);
   const fqdn = `${reversed}.${zone}`;
+  const t0 = Date.now();
+
+  const parseA = (A) => {
+    // Supports results from resolve4(fqdn, { ttl: true }) and normal arrays
+    let addresses = [];
+    let ttl;
+    if (Array.isArray(A) && A.length) {
+      if (typeof A[0] === 'object' && A[0] && 'address' in A[0]) {
+        addresses = A.map(r => r.address);
+        const ttls = A.map(r => r.ttl).filter(v => Number.isFinite(v));
+        if (ttls.length) ttl = Math.min(...ttls);
+      } else {
+        addresses = A;
+      }
+    }
+    return { addresses, ttl };
+  };
+
   try {
-    const A = await withTimeout(dns.resolve4(fqdn), timeoutMs, 'DNS timeout');
+    const Araw = await withTimeout(dns.resolve4(fqdn, { ttl: true }), timeoutMs, 'DNS timeout');
+    const { addresses, ttl } = parseA(Araw);
+
     let TXT = [];
     try {
       const txt = await withTimeout(dns.resolveTxt(fqdn), timeoutMs, 'DNS timeout');
       TXT = txt.flat().map(String);
-    } catch (e) {
+    } catch {
       // ignore TXT failures
     }
-    return { zone, fqdn, listed: true, a: A, txt: TXT };
+
+    return { zone, fqdn, listed: true, a: addresses, txt: TXT, ttl, ms: Date.now() - t0 };
   } catch (err) {
     const code = err && err.code ? err.code : err.message || 'ERR';
+    const ms = Date.now() - t0;
     // ENOTFOUND/ENODATA => not listed
     if (code === 'ENOTFOUND' || code === 'ENODATA') {
-      return { zone, fqdn, listed: false };
+      return { zone, fqdn, listed: false, ms };
     }
     // Other errors (REFUSED/SERVFAIL/TIMEOUT etc.) are informational
-    return { zone, fqdn, listed: false, error: code };
+    return { zone, fqdn, listed: false, error: code, ms };
   }
 }
 
