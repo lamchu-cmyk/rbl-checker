@@ -145,10 +145,13 @@
     e.preventDefault();
     const cidr = document.getElementById('cidr').value.trim();
     out.textContent = 'Đang quét...';
+
+    const body = { cidr };
+
     const res = await fetch('/check', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ cidr })
+      body: JSON.stringify(body)
     });
     const json = await res.json();
     if (res.ok) {

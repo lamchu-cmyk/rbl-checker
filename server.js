@@ -4,6 +4,96 @@
 const express = require('express');
 const dns = require('node:dns').promises;
 const path = require('node:path');
+const { Resolver } = require('node:dns').promises;
+const https = require('node:https');
+
+const DEFAULT_NAMESERVERS = (process.env.NAMESERVERS || '1.1.1.1,8.8.8.8,9.9.9.9')
+  .split(/\s*,\s*/).filter(Boolean);
+
+function buildResolvers(nameservers) {
+  const list = (Array.isArray(nameservers) ? nameservers
+               : String(nameservers || '').split(','))
+               .map(s => s.trim()).filter(Boolean);
+  const servers = list.length ? list : DEFAULT_NAMESERVERS;
+  return servers.map(ns => {
+    const r = new Resolver();
+    r.setServers([ns]);
+    return r;
+  });
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function resolveWithResolvers(resolvers, fqdn, type, timeoutMs) {
+  let lastErr;
+  for (const r of resolvers) {
+    try {
+      if (type === 'A') return await withTimeout(r.resolve4(fqdn, { ttl: true }), timeoutMs, 'DNS timeout');
+      return await withTimeout(r.resolveTxt(fqdn), timeoutMs, 'DNS timeout');
+    } catch (e) {
+      lastErr = e;
+      const code = e && e.code ? e.code : e.message || 'ERR';
+      if (code === 'ENOTFOUND' || code === 'ENODATA') throw e; // không cần thử tiếp
+      // các lỗi khác (TIMEOUT/SERVFAIL/REFUSED) → thử resolver tiếp theo
+    }
+  }
+  // Fallback DoH: Cloudflare → Google
+  try {
+    return await resolveViaDoh('cloudflare', fqdn, type, timeoutMs);
+  } catch (e1) {
+    lastErr = e1;
+  }
+  try {
+    return await resolveViaDoh('google', fqdn, type, timeoutMs);
+  } catch (e2) {
+    lastErr = e2;
+  }
+  throw lastErr;
+}
+
+function httpGetJson(url, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(url, { method: 'GET', headers }, (res) => {
+      let buf = '';
+      res.setEncoding('utf8');
+      res.on('data', (d) => (buf += d));
+      res.on('end', () => {
+        try { resolve(JSON.parse(buf)); } catch (e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+async function resolveViaDoh(provider, fqdn, type, timeoutMs) {
+  const enc = encodeURIComponent;
+  const url = provider === 'cloudflare'
+    ? `https://cloudflare-dns.com/dns-query?name=${enc(fqdn)}&type=${enc(type)}`
+    : `https://dns.google/resolve?name=${enc(fqdn)}&type=${enc(type)}`;
+
+  const headers = provider === 'cloudflare' ? { accept: 'application/dns-json' } : {};
+  const json = await withTimeout(httpGetJson(url, headers), timeoutMs, 'DNS timeout');
+
+  // Status 0 = NOERROR; 3 = NXDOMAIN; 2 = SERVFAIL; 5 = REFUSED
+  if (json.Status === 0 && Array.isArray(json.Answer)) {
+    if (type === 'A') {
+      return json.Answer
+        .filter(a => a.type === 1 && typeof a.data === 'string')
+        .map(a => ({ address: a.data, ttl: a.TTL }));
+    } else if (type === 'TXT') {
+      const txts = json.Answer
+        .filter(a => a.type === 16 && typeof a.data === 'string')
+        .map(a => a.data.replace(/^"|"$/g, ''));
+      // match Node's shape: string[][]
+      return txts.map(s => [s]);
+    }
+  }
+  const map = { 3: 'ENOTFOUND', 2: 'SERVFAIL', 5: 'REFUSED' };
+  const err = new Error(map[json.Status] || `DOH_STATUS_${json.Status}`);
+  err.code = map[json.Status] || `DOH_STATUS_${json.Status}`;
+  throw err;
+}
 
 const app = express();
 app.use(express.json());
@@ -142,13 +232,12 @@ function reverseIp(ip) {
   return ip.split('.').reverse().join('.');
 }
 
-async function checkOneZone(ip, zone, { timeoutMs = 3000 } = {}) {
+async function checkOneZone(ip, zone, { resolvers, timeoutMs = 5000, jitterMs = 200 } = {}) {
   const reversed = reverseIp(ip);
   const fqdn = `${reversed}.${zone}`;
   const t0 = Date.now();
 
   const parseA = (A) => {
-    // Supports results from resolve4(fqdn, { ttl: true }) and normal arrays
     let addresses = [];
     let ttl;
     if (Array.isArray(A) && A.length) {
@@ -163,43 +252,36 @@ async function checkOneZone(ip, zone, { timeoutMs = 3000 } = {}) {
     return { addresses, ttl };
   };
 
+  if (jitterMs) await sleep(Math.random() * jitterMs);
+
   try {
-    const Araw = await withTimeout(dns.resolve4(fqdn, { ttl: true }), timeoutMs, 'DNS timeout');
+    const Araw = await resolveWithResolvers(resolvers, fqdn, 'A', timeoutMs);
     const { addresses, ttl } = parseA(Araw);
 
     let TXT = [];
     try {
-      const txt = await withTimeout(dns.resolveTxt(fqdn), timeoutMs, 'DNS timeout');
+      const txt = await resolveWithResolvers(resolvers, fqdn, 'TXT', timeoutMs);
       TXT = txt.flat().map(String);
-    } catch {
-      // ignore TXT failures
-    }
+    } catch { /* ignore TXT failures */ }
 
     return { zone, fqdn, listed: true, a: addresses, txt: TXT, ttl, ms: Date.now() - t0 };
   } catch (err) {
     const code = err && err.code ? err.code : err.message || 'ERR';
     const ms = Date.now() - t0;
-    // ENOTFOUND/ENODATA => not listed
     if (code === 'ENOTFOUND' || code === 'ENODATA') {
       return { zone, fqdn, listed: false, ms };
     }
-    // Other errors (REFUSED/SERVFAIL/TIMEOUT etc.) are informational
     return { zone, fqdn, listed: false, error: code, ms };
   }
 }
 
-async function checkIpAgainstDnsbls(ip, zones, { perIpConcurrency = 20, timeoutMs = 3000 } = {}) {
+async function checkIpAgainstDnsbls(ip, zones, opts = {}) {
+  const { perIpConcurrency = 8, timeoutMs = 5000, resolvers } = opts;
   const limit = createLimiter(perIpConcurrency);
-  const tasks = zones.map((z) => limit(() => checkOneZone(ip, z, { timeoutMs })));
+  const tasks = zones.map(z => limit(() => checkOneZone(ip, z, { timeoutMs, resolvers })));
   const details = await Promise.all(tasks);
   const listedZones = details.filter(d => d.listed).map(d => d.zone);
-  return {
-    ip,
-    listed: listedZones.length > 0,
-    listedCount: listedZones.length,
-    listedZones,
-    details,
-  };
+  return { ip, listed: listedZones.length > 0, listedCount: listedZones.length, listedZones, details };
 }
 
 // ---------- Routes ----------
@@ -214,17 +296,25 @@ app.get('/blacklists', (_req, res) => {
 // POST /check { cidr, zones?, timeoutMs?, ipConcurrency?, perIpConcurrency? }
 app.post('/check', async (req, res) => {
   try {
-    const { cidr, zones, timeoutMs = 3000, ipConcurrency = 4, perIpConcurrency = 20 } = req.body || {};
+    const {
+      cidr,
+      zones,
+      timeoutMs = 5000,
+      ipConcurrency = 2,
+      perIpConcurrency = 8,
+      nameservers
+    } = req.body || {};
     if (!cidr || typeof cidr !== 'string') {
       return res.status(400).json({ error: 'Missing "cidr" string in body' });
     }
 
     const info = cidrInfo(cidr);
     const zonesToUse = Array.isArray(zones) && zones.length ? zones : DEFAULT_DNSBLS;
+    const resolvers = buildResolvers(nameservers);
 
-    const ipLimiter = createLimiter(Number(ipConcurrency) || 4);
+    const ipLimiter = createLimiter(Number(ipConcurrency) || 2);
     const tasks = info.hosts.map(ip =>
-      ipLimiter(() => checkIpAgainstDnsbls(ip, zonesToUse, { perIpConcurrency, timeoutMs }))
+      ipLimiter(() => checkIpAgainstDnsbls(ip, zonesToUse, { perIpConcurrency, timeoutMs, resolvers }))
     );
     const results = await Promise.all(tasks);
 
@@ -238,6 +328,7 @@ app.post('/check', async (req, res) => {
       usableHostCount: info.hosts.length,
       zonesChecked: zonesToUse.length,
       timeoutMs,
+      nameservers: (Array.isArray(nameservers) ? nameservers : String(nameservers || '')).split(',').map(s => s.trim()).filter(Boolean),
       results,
       generatedAt: new Date().toISOString(),
     });
