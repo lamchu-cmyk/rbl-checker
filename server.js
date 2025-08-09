@@ -3,9 +3,12 @@
 
 const express = require('express');
 const dns = require('node:dns').promises;
+const path = require('node:path');
 
 const app = express();
 app.use(express.json());
+app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, 'views'));
 
 const PORT = process.env.PORT || 3000;
 
@@ -179,44 +182,7 @@ async function checkIpAgainstDnsbls(ip, zones, { perIpConcurrency = 20, timeoutM
 
 // ---------- Routes ----------
 app.get('/', (_req, res) => {
-  res.type('html').send(`<!doctype html>
-<html lang="vi">
-<head>
-  <meta charset="utf-8" />
-  <title>RBL Checker</title>
-  <style>
-    body { font-family: sans-serif; margin: 24px; }
-    input, button { font-size: 16px; padding: 6px 10px; }
-    .muted { color: #666; }
-    pre { background: #f6f8fa; padding: 12px; overflow: auto; }
-  </style>
-</head>
-<body>
-  <h2>RBL Checker (CIDR IPv4)</h2>
-  <form id="f">
-    <input id="cidr" name="cidr" placeholder="27.76.172.200/29" size="28" required />
-    <button>Check</button>
-  </form>
-  <p class="muted">Lưu ý: một số DNSBL như b.barracudacentral.org cần đăng ký, có thể trả về REFUSED/SERVFAIL.</p>
-  <pre id="out"></pre>
-  <script>
-  const f = document.getElementById('f');
-  const out = document.getElementById('out');
-  f.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const cidr = document.getElementById('cidr').value.trim();
-    out.textContent = 'Đang quét...';
-    const res = await fetch('/check', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ cidr })
-    });
-    const json = await res.json();
-    out.textContent = JSON.stringify(json, null, 2);
-  });
-  </script>
-</body>
-</html>`);
+  res.render('index');
 });
 
 app.get('/blacklists', (_req, res) => {
